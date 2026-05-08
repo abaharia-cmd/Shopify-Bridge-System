@@ -9,6 +9,11 @@ const schema = z.object({
   SHOPIFY_API_VERSION: z.string().regex(/^\d{4}-\d{2}$/, "expected YYYY-MM"),
   SUPABASE_URL: z.string().url(),
   SUPABASE_SECRET_KEY: z.string().min(1),
+  // Phase 3B (incremental sync). Optional during dev so verify-connections
+  // and existing scripts keep working without these set; required at runtime
+  // by the webhook receiver and cron endpoint, which check for empty values.
+  SHOPIFY_WEBHOOK_SECRET: z.string().optional(),
+  CATCHUP_CRON_SECRET: z.string().optional(),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),

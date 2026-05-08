@@ -8,7 +8,18 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "verify": "tsx --env-file=.env.local src/scripts/verify-connections.ts"
+    "verify": "tsx --env-file=.env.local src/scripts/verify-connections.ts",
+    "dry-run": "tsx --env-file=.env.local src/scripts/dry-run.ts",
+    "sync-orders-range": "tsx --env-file=.env.local src/scripts/sync-orders-range.ts",
+    "audit-data": "tsx --env-file=.env.local src/scripts/audit-data.ts",
+    "probe-order-schema": "tsx --env-file=.env.local src/scripts/probe-order-schema.ts",
+    "dry-run-pass": "tsx --env-file=.env.local src/scripts/dry-run-pass.ts",
+    "run-pass-full": "tsx --env-file=.env.local src/scripts/run-pass-full.ts",
+    "run-pass-paginated": "tsx --env-file=.env.local src/scripts/run-pass-paginated.ts",
+    "probe-wave-2": "tsx --env-file=.env.local src/scripts/probe-wave-2.ts",
+    "audit-shopify-vs-db": "tsx --env-file=.env.local src/scripts/audit-shopify-vs-db.ts",
+    "sync-resource": "tsx --env-file=.env.local src/scripts/sync-resource.ts",
+    "mock-webhook": "tsx --env-file=.env.local src/scripts/mock-webhook.ts"
   },
   "dependencies": {
     "@shopify/admin-api-client": "^1.1.2",

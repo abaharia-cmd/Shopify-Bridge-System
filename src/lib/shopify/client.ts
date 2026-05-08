@@ -25,9 +25,17 @@ export async function query<T>(
       { errors: response.errors, elapsedMs },
       "Shopify GraphQL request failed",
     );
-    throw new Error(
-      `Shopify GraphQL error: ${response.errors.message ?? "unknown"}`,
-    );
+    // The Shopify SDK puts the readable problems under `graphQLErrors`. Fall
+    // back to the generic `message` if absent.
+    const errs = response.errors as unknown as {
+      message?: string;
+      graphQLErrors?: { message: string }[];
+    };
+    const detail =
+      errs.graphQLErrors && errs.graphQLErrors.length
+        ? errs.graphQLErrors.map((e) => e.message).join("; ")
+        : (errs.message ?? "unknown");
+    throw new Error(`Shopify GraphQL error: ${detail}`);
   }
 
   if (!response.data) {
