@@ -147,7 +147,7 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
       return null;
     }
     if (failedRows && failedRows.length) {
-      candidate = failedRows[0] as WebhookEventRow & { status: string };
+      candidate = failedRows[0] as unknown as WebhookEventRow & { status: string };
     }
   }
 

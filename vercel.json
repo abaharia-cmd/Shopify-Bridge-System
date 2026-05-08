@@ -1,1 +1,9 @@
-{}
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/cron/catchup-sync",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
