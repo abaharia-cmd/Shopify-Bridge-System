@@ -19,7 +19,8 @@
     "probe-wave-2": "tsx --env-file=.env.local src/scripts/probe-wave-2.ts",
     "audit-shopify-vs-db": "tsx --env-file=.env.local src/scripts/audit-shopify-vs-db.ts",
     "sync-resource": "tsx --env-file=.env.local src/scripts/sync-resource.ts",
-    "mock-webhook": "tsx --env-file=.env.local src/scripts/mock-webhook.ts"
+    "mock-webhook": "tsx --env-file=.env.local src/scripts/mock-webhook.ts",
+    "register-webhooks": "tsx --env-file=.env.local src/scripts/register-webhooks.ts"
   },
   "dependencies": {
     "@shopify/admin-api-client": "^1.1.2",

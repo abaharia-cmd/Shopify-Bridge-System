@@ -29,7 +29,16 @@ const log = logger.child({ module: "worker.catchupSync" });
 
 const CATCHUP_CONFIG_KEY = "last_successful_catchup";
 const DEFAULT_LOOKBACK_DAYS = 7;
-const MAX_IDS_PER_RESOURCE = 5000; // safety cap per run
+// Per-resource cap. Sized to fit Vercel's 300s function budget across 4
+// resources (~70s each). At ~2s per incremental sync (parent + children),
+// 200 records ≈ 400s worst case for one resource — but in practice incremental
+// is ~1.5s including network, so 200 fits comfortably. If the backlog is
+// larger, multiple cron ticks (or manual `curl` invocations) drain it.
+const MAX_IDS_PER_RESOURCE = 200;
+// Per-resource wall-clock budget. Stops dispatching new incrementals once
+// elapsed; the cursor still advances if everything dispatched succeeded.
+// Matches the cron's deployment-level maxDuration:300 minus a 30s buffer.
+const PER_RESOURCE_BUDGET_MS = 60_000;
 
 // Resources we run catchup for. Matches the webhook topics list — same set
 // of "live operational" resources. Catalog (variants, options, media) ride
@@ -113,26 +122,37 @@ async function catchupOne(resource: CatchupResource): Promise<CatchupResult> {
   log.info({ resource, since }, "catchupOne: fetching ids");
 
   const ids = await fetchIdsUpdatedSince(resource, since, MAX_IDS_PER_RESOURCE);
-
+  const t0 = Date.now();
   let syncedOk = 0;
   let syncedFailed = 0;
   let notFound = 0;
+  let processed = 0;
+  let budgetExceeded = false;
+
   for (const id of ids) {
+    if (Date.now() - t0 > PER_RESOURCE_BUDGET_MS) {
+      budgetExceeded = true;
+      log.warn(
+        { resource, processed, remaining: ids.length - processed, elapsedMs: Date.now() - t0 },
+        "catchupOne: per-resource budget exceeded, stopping",
+      );
+      break;
+    }
     const r = await runIncremental({
       resourceName: resource,
       id,
       triggeredBy: "cron:catchup-sync",
     });
+    processed += 1;
     if (r.notFound) notFound += 1;
     if (r.errorMessage) syncedFailed += 1;
     else syncedOk += 1;
   }
 
-  // Only advance the cursor if every record landed cleanly. A partial failure
-  // means we must retry from the same `since` next run — so we leave the
-  // config row alone. Acceptable cost: one re-fetch of the cleanly-synced
-  // records (idempotent upserts make this safe).
-  if (syncedFailed === 0) {
+  // Only advance the cursor if every record landed cleanly AND we processed
+  // every id we fetched. Budget-cut runs must NOT advance — the unprocessed
+  // tail is still pending and the next tick needs to see it.
+  if (syncedFailed === 0 && !budgetExceeded && processed === ids.length) {
     await setLastCatchup(resource, new Date());
   } else {
     log.warn(

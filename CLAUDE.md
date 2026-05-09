@@ -6,7 +6,9 @@
 Mirror every record of every exportable resource from the Shopify store `ourkids1.myshopify.com` into a Supabase database, with verifiable completeness and ongoing real-time sync. End goal: a single source of truth for all Shopify data, queryable independently of Shopify, ready for future tools to consume (analytics, AI agents, internal apps).
 
 ## Current Phase
-**Phase 3B (incremental sync infrastructure) code-complete** (2026-05-08) — webhook receiver + HMAC verifier + queue + processor + incremental runner + `incremental(id)` & `softDelete(id)` on 4 top-level modules (orders, customers, products, collections) + daily catchup-sync cron + mock-webhook test harness. `npm run build` + `npx tsc --noEmit` + `npm run lint` clean. **NOT YET DEPLOYED** — Phase 3C will register webhooks in Shopify, deploy to Vercel, run mock-webhook end-to-end, and go live.
+**Phase 3C complete — system is live in production** (2026-05-09). Production URL `https://shopify-bridge-system.vercel.app` (Vercel), 18 webhook subscriptions registered with Shopify, catchup-sync cron scheduled at 00:00 UTC daily, end-to-end smoke test traced cleanly (product edit → webhook → upsert → mirror). `npm run audit-data` exit 0, audit-shopify-vs-db unchanged.
+
+Pre-Phase-3C state (2026-05-08): **Phase 3B code-complete** — webhook receiver + HMAC verifier + queue + processor + incremental runner + `incremental(id)` & `softDelete(id)` on 4 top-level modules (orders, customers, products, collections) + daily catchup-sync cron + mock-webhook test harness. `npm run build` + `npx tsc --noEmit` + `npm run lint` clean.
 
 Pre-Phase-3B state (2026-05-07): **Wave 3 Phase A complete** — Shopify-vs-DB completeness audit landed 12 ✅ matches, 3 ⚠️ tolerance drifts (all <0.13%), 9 🛑 flags (all explained: live-store growth, real-vs-bulk count semantics, ratio-sampling small-n noise on rare-event tables). 20/20 spot-checks clean. Architect signed off.
 
@@ -24,7 +26,7 @@ Phase roadmap (revised 2026-05-01 per architect's Phase 2 brief):
 - [x] Phase 3 Wave 3 (hardening): Cross-module CASCADE FKs flipped RESTRICT in 2 migrations + 4 module extractors flipped from `replaceByParent` → upsert-only (2026-05-07)
 - [x] Wave 3 Phase A: Shopify-vs-DB completeness audit (`npm run audit-shopify-vs-db`) — direct counts + paginated fallback for AT_LEAST + ratio sampling for child tables + 5×4 spot checks (2026-05-07)
 - [x] Phase 3B: Incremental sync infrastructure — code-complete, not deployed (2026-05-08)
-- [ ] Phase 3C: Register webhooks in Shopify Admin, deploy to Vercel, run mock-webhook against deployment, monitor 24h
+- [x] Phase 3C: Deployed to Vercel, 18 webhooks registered, end-to-end smoke test passed (2026-05-09)
 - [ ] Phase 4: Hardened webhooks (signed URLs, replay protection, HMAC rotation)
 - [ ] Phase 5: Reconciliation cron (daily existence + weekly content) — built on top of incrementalRunner
 - [ ] Phase 6: Auth + locked-down API (the control room is unauthenticated today)
@@ -118,6 +120,16 @@ End-to-end incremental sync infrastructure for live updates via webhooks + sched
 - **New env vars** ([src/lib/config.ts](src/lib/config.ts)): `SHOPIFY_WEBHOOK_SECRET` (signing secret from Shopify webhook config), `CATCHUP_CRON_SECRET` (Vercel Cron auth). Both optional in dev so existing scripts keep working without them set; required at runtime by the receiver / cron endpoint, which 401 if missing.
 - **Build hygiene**: `npm run build` clean, `npx tsc --noEmit` clean, `npm run lint` clean (no new errors; pre-existing warnings in files.ts and probe-wave-2.ts unchanged).
 - **NOT YET DEPLOYED, NOT registered with Shopify.** Phase 3C will: (1) run mock-webhook locally to confirm 6/6 pass, (2) register the 14 webhooks in Shopify Admin (orders/{create,updated,cancelled,fulfilled,partially_fulfilled}, customers/{create,update,delete}, products/{create,update,delete}, collections/{create,update,delete}, refunds/create, fulfillments/{create,update}, inventory_levels/update), (3) deploy to Vercel with secrets, (4) configure vercel.json cron to hit `/api/cron/catchup-sync` daily at 03:00 Cairo, (5) monitor 24h.
+
+### Phase 3C deliverables (2026-05-09) — system live in production
+- **Production deploy**: `https://shopify-bridge-system.vercel.app` on Vercel project `prj_8FOeUsqheKbAtLKeTvJb2pH8YESp`. Framework forced to `nextjs` in `vercel.json` (the project was created with preset `Other`, which 404'd every route despite the build registering them — see Gotcha 2026-05-08). Stable prod alias is the webhook callback URL.
+- **18 Shopify webhook subscriptions registered** via [src/scripts/register-webhooks.ts](src/scripts/register-webhooks.ts) (`npm run register-webhooks`): orders/{create,updated,cancelled,fulfilled,partially_fulfilled}, customers/{create,update,delete}, products/{create,update,delete}, collections/{create,update,delete}, inventory_levels/update, refunds/create, fulfillments/{create,update}. Idempotent — re-runs report `kept` for already-subscribed topics.
+- **Vercel Cron**: `/api/cron/catchup-sync` scheduled at `0 0 * * *` (00:00 UTC = 03:00 Cairo winter / 02:00 summer). Auth via `Authorization: Bearer <CATCHUP_CRON_SECRET>`.
+- **End-to-end smoke test passed**: user edited a product in Shopify admin → webhook arrived at receiver in <5s → HMAC verified → enqueued in `webhook_events` → processor fetched product+children via `module.incremental(id)` → upserted into `shopify.products` → `synced_at` updated. Trace confirmed for 3 sample products with `processing_duration_ms` 2-12s under normal load.
+- **Receiver tuning**: added `export const maxDuration = 300` to [src/app/api/webhooks/shopify/route.ts](src/app/api/webhooks/shopify/route.ts) so the fire-and-forget processor has full Vercel function budget to drain bursts (default 60s killed it mid-drain when Shopify replayed yesterday's failed webhooks). `maxEvents: 100` per processor invocation matches the budget at ~2s per webhook.
+- **Catchup tuning**: lowered `MAX_IDS_PER_RESOURCE` from 5,000 to 200, added `PER_RESOURCE_BUDGET_MS = 60_000` so the cron fits in Vercel's 300s function limit even with a backlog (4 resources × 60s = 240s + drain time). Cursor advances only on full-clean run that processed every fetched id.
+- **HMAC bug discovered + fixed**: `SHOPIFY_WEBHOOK_SECRET` must be the custom app's **API secret key** (a.k.a. "client secret"), found at Shopify Admin → Settings → Apps and sales channels → Develop apps → (the app whose `shpat_...` token is `SHOPIFY_ADMIN_API_TOKEN`) → API credentials tab → "API key and secret key" section → "API secret key". The page even confirms: "Use your client secret to verify incoming webhooks." A random hex value (or anything else) makes every real webhook 401 because Shopify signs with this app-level secret. The mock-webhook test never caught this because both sides read the same `.env.local` value — only real Shopify webhooks expose the mismatch.
+- **Vercel env scope gotcha**: `vercel env add NAME production` only sets the Production scope. Preview deployments (auto-triggered by `git push` to non-main branches) need Preview scope too — added with `vercel env add NAME preview <branch> --value <v> --yes --force`. CLI v53 requires the `<branch>` argument even when documenting an "all branches" form.
 
 ## Roles
 - **Architect** = Claude on the web (chat). Owns architecture, schema design, decisions. Source of truth for "what" and "why".
@@ -460,6 +472,30 @@ Each catchup invocation queries Shopify for IDs `updated_at:>=<lastCursor>`, syn
 
 ### 2026-05-08 — Webhook processor uses optimistic UPDATE, not SELECT...FOR UPDATE
 Concurrency between Next.js worker instances on Vercel is bounded to 1 per instance; multi-instance scenarios are rare in our workload. The processor claims a row by SELECT...FILTER (oldest received-or-retry-eligible failed), then UPDATEs status='received'→'processing' WITH the original status as a precondition. Whichever caller gets row count = 1 wins; the other gets null and moves on. Avoids needing a transaction-scoped row lock. Will revisit if we see contention in production (Phase 3C/4).
+
+### 2026-05-09 — `SHOPIFY_WEBHOOK_SECRET` is the app's API secret key, NOT a random hex
+Webhooks created via `webhookSubscriptionCreate` are signed with the **API secret key** of the custom Shopify app whose access token (`shpat_...`) is in `SHOPIFY_ADMIN_API_TOKEN`. Found at: Shopify Admin → Settings → Apps and sales channels → Develop apps → (the app) → API credentials tab → "API key and secret key" section → "API secret key". The page itself confirms: "Use your client secret to verify incoming webhooks." Mock-webhook tests will pass regardless because both sides read the same `.env.local` value — only **real** Shopify webhooks expose a wrong secret (every delivery 401s with `webhook HMAC verification failed` in Vercel logs).
+
+### 2026-05-09 — `claimNextEvent` PostgREST `.or()` filter parser breaks on ISO timestamp special chars
+Original query used `.or('status.eq.received,and(status.eq.failed,retry_count.lt.3,last_failed_at.lt.<isoString>)')`. The ISO timestamp's `:` and `.` chars make the OR filter return zero rows even when matching events exist. Rewrote `claimNextEvent` in [src/worker/webhookProcessor.ts](src/worker/webhookProcessor.ts) to do TWO simple `.eq().lt()` queries (received-first, then retry-eligible failed). Two queries are negligible cost; the parser cooperation is worth a lot.
+
+### 2026-05-09 — Vercel Project default framework=`Other` 404s every Next.js route
+Vercel projects created via the dashboard default to Framework Preset "Other" — which means Vercel ignores the `.next/` build output and tries to serve a static site. Build succeeds, the build log proudly lists every `/api/*` route, but every runtime request returns 404 (including `/`). Fix: add `"framework": "nextjs"` to `vercel.json` and redeploy. Also explicitly set `"buildCommand": "next build"` and `"installCommand": "npm install"` for clarity. The `vercel.json` framework setting overrides the dashboard preset.
+
+### 2026-05-09 — Vercel env scope is per-target (production / preview-branch); preview deploys NEED their own
+`vercel env add NAME production --value V --yes --force` only sets the Production scope. GitHub-triggered auto-deploys for non-`main` branches are Previews — they get an isolated env scope and DON'T see Production values. Symptom: build fails with `Invalid environment configuration: SHOPIFY_SHOP_DOMAIN: expected string, received undefined`. Fix: also `vercel env add NAME preview <branch> --value V --yes --force`. CLI v53 *requires* the `<branch>` argument even though its own help text suggests omitting it adds to "all Preview branches".
+
+### 2026-05-09 — Vercel CLI v53 `vercel env add` requires `--value` and `--yes` flags for non-interactive
+Older CLI versions accepted piped stdin input. v53 errors with `action_required: git_branch_required` and prints next-step suggestions instead of consuming stdin. Use `--value` + `--yes` + `--force` for unattended scripts.
+
+### 2026-05-09 — Receiver `maxDuration` default 60s kills the fire-and-forget processor mid-drain
+The receiver returns 200 to Shopify in <5s, then `void processWebhookQueue()` runs in the background. Vercel keeps the function alive for `maxDuration` after the response — default 60s. At ~2s per webhook × 50 maxEvents that's 100s, so the function gets killed mid-drain when Shopify replays a backlog. Fix: `export const maxDuration = 300` in the receiver route + `maxEvents: 100` in the processor call. With Pro-tier 300s budget, one invocation drains ~150 webhooks.
+
+### 2026-05-09 — Shopify silently un-subscribed 3 of 18 webhooks overnight
+Between Phase 3C registration (10 May 10:18 UTC) and the next morning (~12:00 UTC), 3 of the 18 subscriptions were missing from `webhookSubscriptions(first:50)` query results: `orders/updated`, `products/update`, `inventory_levels/update`. Cause unconfirmed — likely Shopify's auto-disable circuit-breaker on subscriptions whose endpoints returned consistent 5xx (our deploy was failing 401-with-no-row at the time, but Shopify counts 4xx differently from 5xx). `register-webhooks.ts` is idempotent (it diffs against existing subscriptions and only creates missing ones), so re-running it restored the 3. Operationally: `npm run register-webhooks` is safe to schedule weekly as a "self-heal" sanity check.
+
+### 2026-05-09 — Shopify retries every failed webhook over ~48h with exponential backoff
+After fixing the HMAC secret, the queue suddenly grew by 600+ entries — Shopify was replaying every webhook from the prior 24h that had returned 401. This is built-in retry behavior (per Shopify docs: 19 retries over 48h with exponential backoff). The drain-in-place worked but slowly (~30s burst → 600 events → ~10 min total drain). No data lost; just a thundering-herd pattern that the receiver's `maxDuration: 300` accommodates.
 
 ## Architectural Decisions
 > Record significant decisions here so future sessions don't re-litigate them. Format: `### [date] — decision` then rationale.

@@ -23,6 +23,12 @@ import { processWebhookQueue } from "@/worker/webhookProcessor";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Vercel keeps the function alive for up to maxDuration after the response is
+// returned. We respond to Shopify in <5s, but the fire-and-forget processor
+// invocation needs time to drain a backlog (~2s per webhook × 50 events).
+// Cap at 300s = Vercel Pro limit. (Default 60s would kill processWebhookQueue
+// mid-drain when a burst of webhooks arrives.)
+export const maxDuration = 300;
 
 const log = logger.child({ module: "api.webhooks.shopify" });
 const metaDb = getSupabaseAdmin("shopify_sync");
@@ -151,7 +157,9 @@ export async function POST(req: Request): Promise<Response> {
   // waiting for the cron tick. The processor is a no-op if another in-process
   // run is already in flight, so this is safe to spam from the receiver.
   // We do NOT await — the response must return within Shopify's 5s budget.
-  void processWebhookQueue({ maxEvents: 50 }).catch((err) => {
+  // maxEvents:100 + maxDuration:300 lets one invocation drain ~100 webhooks
+  // (~2s each) before Vercel terminates the function.
+  void processWebhookQueue({ maxEvents: 100 }).catch((err) => {
     log.error({ err: String(err) }, "background processWebhookQueue failed");
   });
 
