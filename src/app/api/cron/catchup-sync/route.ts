@@ -21,14 +21,20 @@ export const maxDuration = 300;
 const log = logger.child({ module: "api.cron.catchup-sync" });
 
 function isAuthorized(req: Request): boolean {
-  const expected = config.CATCHUP_CRON_SECRET;
-  if (!expected) {
+  // Accept either CATCHUP_CRON_SECRET (our app's own var, used by manual cURL
+  // invocations) OR CRON_SECRET (Vercel's system-managed var that it signs
+  // cron requests with). Vercel auto-injects CRON_SECRET into the env and
+  // uses it as Authorization: Bearer; we must read that exact value.
+  const ours = config.CATCHUP_CRON_SECRET;
+  const vercel = process.env.CRON_SECRET;
+  if (!ours && !vercel) {
     // No secret configured = local dev mode — allow.
     return true;
   }
   const authHeader = req.headers.get("authorization") ?? "";
-  if (authHeader === `Bearer ${expected}`) return true;
-  if (req.headers.get("x-cron-secret") === expected) return true;
+  if (ours && authHeader === `Bearer ${ours}`) return true;
+  if (vercel && authHeader === `Bearer ${vercel}`) return true;
+  if (ours && req.headers.get("x-cron-secret") === ours) return true;
   return false;
 }
 
