@@ -6,7 +6,11 @@
 Mirror every record of every exportable resource from the Shopify store `ourkids1.myshopify.com` into a Supabase database, with verifiable completeness and ongoing real-time sync. End goal: a single source of truth for all Shopify data, queryable independently of Shopify, ready for future tools to consume (analytics, AI agents, internal apps).
 
 ## Current Phase
-**Phase 3C complete — system is live in production** (2026-05-09). Production URL `https://shopify-bridge-system.vercel.app` (Vercel), 18 webhook subscriptions registered with Shopify, catchup-sync cron scheduled at 00:00 UTC daily, end-to-end smoke test traced cleanly (product edit → webhook → upsert → mirror). `npm run audit-data` exit 0, audit-shopify-vs-db unchanged.
+**Phase 3D complete — FulfillmentOrder routing live** (2026-05-12). 1,056 active FOs (status=OPEN/IN_PROGRESS) + 1,774 line-item assignments backfilled. 7 new webhook subscriptions registered (`fulfillment_orders/*`). Mirror now answers "which warehouse is this order assigned to?" for both fulfilled (via `order_fulfillments.fulfillment_origin_location_id`) AND unfulfilled (via `fulfillment_orders.assigned_location_id`) orders. Verified against UI: order #135381 → 3 FOs matching exactly (6 October×2, Stock Warehouse×1, Sheikh Zayed×1).
+
+Pre-Phase-3D state (2026-05-12 earlier): operational tuning — per-minute cron, LIFO claim ordering, 19,275 stale inventory webhooks purged, 527 stuck-in-processing rows reset, CRON_SECRET/CATCHUP_CRON_SECRET dual auth.
+
+Pre-Phase-3C state (2026-05-09): **Phase 3C complete — system is live in production**. Production URL `https://shopify-bridge-system.vercel.app` (Vercel), 18 webhook subscriptions registered with Shopify, catchup-sync cron scheduled at 00:00 UTC daily, end-to-end smoke test traced cleanly (product edit → webhook → upsert → mirror). `npm run audit-data` exit 0, audit-shopify-vs-db unchanged.
 
 Pre-Phase-3C state (2026-05-08): **Phase 3B code-complete** — webhook receiver + HMAC verifier + queue + processor + incremental runner + `incremental(id)` & `softDelete(id)` on 4 top-level modules (orders, customers, products, collections) + daily catchup-sync cron + mock-webhook test harness. `npm run build` + `npx tsc --noEmit` + `npm run lint` clean.
 
@@ -27,6 +31,7 @@ Phase roadmap (revised 2026-05-01 per architect's Phase 2 brief):
 - [x] Wave 3 Phase A: Shopify-vs-DB completeness audit (`npm run audit-shopify-vs-db`) — direct counts + paginated fallback for AT_LEAST + ratio sampling for child tables + 5×4 spot checks (2026-05-07)
 - [x] Phase 3B: Incremental sync infrastructure — code-complete, not deployed (2026-05-08)
 - [x] Phase 3C: Deployed to Vercel, 18 webhooks registered, end-to-end smoke test passed (2026-05-09)
+- [x] Phase 3D: FulfillmentOrder routing — `fulfillment_orders` + `fulfillment_order_line_items` modules backfilled, 7 new webhooks registered (2026-05-12)
 - [ ] Phase 4: Hardened webhooks (signed URLs, replay protection, HMAC rotation)
 - [ ] Phase 5: Reconciliation cron (daily existence + weekly content) — built on top of incrementalRunner
 - [ ] Phase 6: Auth + locked-down API (the control room is unauthenticated today)
