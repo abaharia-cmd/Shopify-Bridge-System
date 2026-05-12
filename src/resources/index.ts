@@ -48,6 +48,10 @@ import navigation_menus from "./navigation_menus";
 import product_translations from "./product_translations";
 import collection_translations from "./collection_translations";
 import translations from "./translations";
+// Phase 3D — FulfillmentOrder routing (per-line-item location assignment).
+// Canonical source for "which warehouse is this order assigned to" — works
+// for fulfilled AND unfulfilled orders (Order.fulfillments is null for the latter).
+import fulfillment_orders from "./fulfillment_orders";
 
 export const resourceRegistry: Record<string, ResourceModule> = {
   shop,
@@ -91,4 +95,6 @@ export const resourceRegistry: Record<string, ResourceModule> = {
   product_translations,
   collection_translations,
   translations,
+  // Phase 3D
+  fulfillment_orders,
 };

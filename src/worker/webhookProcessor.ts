@@ -319,6 +319,20 @@ async function routeAndRun(ev: WebhookEventRow): Promise<void> {
       );
       return;
     }
+    case "fulfillment_orders": {
+      // All fulfillment_orders/* topics: order_routing_complete, moved, split,
+      // merged, cancelled, placed_on_hold, hold_released, etc. The payload's
+      // top-level id IS the FulfillmentOrder id; the receiver already extracted
+      // it as ev.resource_id. Re-fetch the FO and upsert via incremental.
+      if (!ev.resource_id) throw new Error("fulfillment_orders webhook: no resource_id");
+      const r = await runIncremental({
+        resourceName: "fulfillment_orders",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
     default: {
       throw new Error(`unrouted webhook topic: ${ev.topic}`);
     }

@@ -48,6 +48,16 @@ const TOPICS: { graphqlTopic: string; restTopic: string }[] = [
   { graphqlTopic: "REFUNDS_CREATE", restTopic: "refunds/create" },
   { graphqlTopic: "FULFILLMENTS_CREATE", restTopic: "fulfillments/create" },
   { graphqlTopic: "FULFILLMENTS_UPDATE", restTopic: "fulfillments/update" },
+  // Phase 3D — FulfillmentOrder routing topics. Cover the lifecycle:
+  // routing complete (assignment), reassignment (moved), split, merged,
+  // cancelled, hold/release. These keep our per-line-item location data live.
+  { graphqlTopic: "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE", restTopic: "fulfillment_orders/order_routing_complete" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_MOVED", restTopic: "fulfillment_orders/moved" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_SPLIT", restTopic: "fulfillment_orders/split" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_MERGED", restTopic: "fulfillment_orders/merged" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_CANCELLED", restTopic: "fulfillment_orders/cancelled" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_PLACED_ON_HOLD", restTopic: "fulfillment_orders/placed_on_hold" },
+  { graphqlTopic: "FULFILLMENT_ORDERS_HOLD_RELEASED", restTopic: "fulfillment_orders/hold_released" },
 ];
 
 interface ExistingSub {

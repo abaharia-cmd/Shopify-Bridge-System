@@ -63,6 +63,7 @@ function extractResourceId(payload: any, topic: string): string | null {
       collections: "Collection",
       refunds: "Refund",
       fulfillments: "Fulfillment",
+      fulfillment_orders: "FulfillmentOrder",
       inventory_levels: "InventoryLevel",
     };
     const t = TYPE_MAP[root];
