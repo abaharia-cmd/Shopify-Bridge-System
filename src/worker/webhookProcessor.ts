@@ -114,12 +114,17 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
   const SELECT_COLS =
     "id, shopify_webhook_id, topic, resource_id, resource_name, payload, retry_count, hmac_valid, status";
 
-  // 1. Oldest still-untried event.
+  // 1. Newest still-untried event (LIFO). Rationale: with sustained inventory
+  // churn, FIFO would starve fresh events behind days-old backlog. Each event
+  // re-fetches the resource's CURRENT state from Shopify, so processing the
+  // newest event for a resource is functionally equivalent to processing all
+  // older events for the same resource — the mirror lands at the same place.
+  // Old events that never get claimed are harmless; they'll be GC'd later.
   const { data: receivedRows, error: rxErr } = await supabaseAdmin
     .from("webhook_events")
     .select(SELECT_COLS)
     .eq("status", "received")
-    .order("received_at", { ascending: true })
+    .order("received_at", { ascending: false })
     .limit(1);
   if (rxErr) {
     log.error({ err: rxErr.message }, "claimNextEvent received-select failed");
@@ -140,7 +145,7 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
       .eq("status", "failed")
       .lt("retry_count", MAX_RETRIES)
       .lt("last_failed_at", cutoff)
-      .order("last_failed_at", { ascending: true })
+      .order("last_failed_at", { ascending: false })
       .limit(1);
     if (fxErr) {
       log.error({ err: fxErr.message }, "claimNextEvent failed-select failed");
