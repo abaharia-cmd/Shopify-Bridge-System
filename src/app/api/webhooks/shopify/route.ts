@@ -49,6 +49,23 @@ function parseTopic(topic: string): { resourceName: string; action: string } {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractResourceId(payload: any, topic: string): string | null {
   if (!payload || typeof payload !== "object") return null;
+  // 0. Some topics wrap the resource under a typed key. Shopify is not
+  //    consistent across topics — fulfillment_orders/order_routing_complete
+  //    uses `fulfillment_order`, .../moved uses `moved_fulfillment_order`,
+  //    .../split uses split_fulfillment_orders[], etc. Try the common shapes.
+  if (topic.startsWith("fulfillment_orders/")) {
+    const fo =
+      payload.fulfillment_order ??
+      payload.moved_fulfillment_order ??
+      payload.original_fulfillment_order ??
+      (Array.isArray(payload.split_fulfillment_orders) ? payload.split_fulfillment_orders[0] : null) ??
+      null;
+    if (fo) {
+      if (typeof fo.admin_graphql_api_id === "string") return fo.admin_graphql_api_id;
+      if (typeof fo.id === "string" && fo.id.startsWith("gid://")) return fo.id;
+      if (fo.id != null) return `gid://shopify/FulfillmentOrder/${fo.id}`;
+    }
+  }
   // 1. admin_graphql_api_id is the explicit GID (preferred).
   if (typeof payload.admin_graphql_api_id === "string") {
     return payload.admin_graphql_api_id;
