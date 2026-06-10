@@ -10,7 +10,8 @@ async function paginateCount(filter: string | null, label: string): Promise<numb
     const q = filter
       ? `query Q($c: String) { fulfillmentOrders(first: 100, after: $c, query: "${filter}") { edges { node { id status order { id } } } pageInfo { hasNextPage endCursor } } }`
       : `query Q($c: String) { fulfillmentOrders(first: 100, after: $c) { edges { node { id status order { id } } } pageInfo { hasNextPage endCursor } } }`;
-    const r = await query<{ fulfillmentOrders: { edges: { node: { id: string; status: string; order: { id: string } } }[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }>(q, { c: cursor });
+    type Page = { fulfillmentOrders: { edges: { node: { id: string; status: string; order: { id: string } } }[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } };
+    const r = await query<Page>(q, { c: cursor });
     count += r.fulfillmentOrders.edges.length;
     pages += 1;
     if (!r.fulfillmentOrders.pageInfo.hasNextPage) break;
