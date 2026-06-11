@@ -1,5 +1,6 @@
 import type { ResourceModule, MainRow, RawPayload, ChildExtractor } from "./types";
 import { pickChildren } from "../worker/jsonlStreamer";
+import { query } from "../lib/shopify/client";
 
 // Bulk inner-query: inventoryItems + their inventoryLevels (per-location).
 // Single bulk op populates both shopify.inventory_items and shopify.inventory_levels.
@@ -66,17 +67,36 @@ const QUERY = /* GraphQL */ `
   }
 `;
 
+function edgeNodes(connOrChildren: unknown): RawPayload[] {
+  const c = connOrChildren as RawPayload | undefined;
+  if (!c) return [];
+  if (Array.isArray(c)) return c;
+  if (c.edges) return c.edges.map((e: RawPayload) => e.node);
+  return [];
+}
+
+// Shape-agnostic levels accessor. Bulk JSONL flattens InventoryLevel into
+// `_children.inventory_level`; regular GraphQL (incremental path) returns
+// `raw.inventoryLevels.edges[].node`. Both paths use this helper.
+function levelsOf(raw: RawPayload): RawPayload[] {
+  const fromBulk = pickChildren(raw, "inventory_level");
+  return fromBulk.length ? fromBulk : edgeNodes(raw.inventoryLevels);
+}
+
 const levelsExtractor: ChildExtractor = {
   table: "inventory_levels",
   parentFk: "inventory_item_id",
-  replaceByParent: true,
+  // Upsert-only (NOT replaceByParent). Phase 1 had cross-module CASCADE FKs
+  // pointing AT inventory_levels — a DELETE here would propagate. Even with
+  // those flipped to RESTRICT, upsert is simpler and idempotent given the
+  // composite UNIQUE below.
   // Composite UNIQUE on (inventory_item_id, location_id) — one level row per
   // (item, location) pair. Shopify re-emits the same level with the same
   // location ID across syncs; route to the natural-key constraint to make
   // upserts idempotent on collision.
   onConflict: "inventory_item_id,location_id",
   extract: (raw, parent, ctx) => {
-    const levels = pickChildren(raw, "inventory_level");
+    const levels = levelsOf(raw);
     return levels.map((l) => {
       // Map quantities array to per-name columns.
       const q: Record<string, number> = {};
@@ -146,6 +166,83 @@ const inventory_items: ResourceModule = {
     return row;
   },
   childExtractors: [levelsExtractor],
+
+  // ─── Incremental sync ────────────────────────────────────────────────────
+  // Mirrors the bulk QUERY for ONE inventoryItem. Adds `first: N` to the
+  // connections (countryHarmonizedSystemCodes, inventoryLevels). Maintenance:
+  // any field added to QUERY must also be added here, or incremental upserts
+  // will null-overwrite that column.
+  //
+  // Routed from inventory_levels/update webhooks: the receiver only has
+  // inventory_item_id + location_id + available; we re-fetch the full item
+  // and ALL its levels to keep the mirror's other quantity columns
+  // (committed, incoming, on_hand, etc.) in sync.
+  incremental: async (id: string): Promise<RawPayload | null> => {
+    const data = await query<{ inventoryItem: RawPayload | null }>(
+      /* GraphQL */ `
+        query InventoryItemById($id: ID!) {
+          inventoryItem(id: $id) {
+            id
+            legacyResourceId
+            sku
+            tracked
+            requiresShipping
+            unitCost {
+              amount
+              currencyCode
+            }
+            countryCodeOfOrigin
+            provinceCodeOfOrigin
+            harmonizedSystemCode
+            countryHarmonizedSystemCodes(first: 250) {
+              edges {
+                node {
+                  countryCode
+                  harmonizedSystemCode
+                }
+              }
+            }
+            measurement {
+              weight {
+                value
+                unit
+              }
+            }
+            inventoryHistoryUrl
+            duplicateSkuCount
+            locationsCount {
+              count
+            }
+            variant {
+              id
+            }
+            createdAt
+            updatedAt
+            inventoryLevels(first: 50) {
+              edges {
+                node {
+                  id
+                  location {
+                    id
+                  }
+                  quantities(names: ["available","committed","incoming","on_hand","reserved","damaged","safety_stock","quality_control"]) {
+                    name
+                    quantity
+                  }
+                  canDeactivate
+                  deactivationAlert
+                  createdAt
+                  updatedAt
+                }
+              }
+            }
+          }
+        }
+      `,
+      { id },
+    );
+    return data.inventoryItem ?? null;
+  },
 };
 
 export default inventory_items;

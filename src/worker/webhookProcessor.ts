@@ -34,6 +34,12 @@ const log = logger.child({ module: "worker.webhookProcessor" });
 
 const MAX_RETRIES = 3;
 
+// Stuck-row cleanup window. Vercel functions max out at 300s; if a row has
+// been claimed (status='processing') for longer than this, the worker that
+// claimed it is definitively dead. Reset it to 'received' so the next
+// processor picks it up. 10 min is comfortably > 5 min Vercel ceiling.
+const STUCK_PROCESSING_MS = 10 * 60_000;
+
 // Ensure only one in-process processor runs at a time. Callers can fire and
 // forget; subsequent calls during an in-flight run no-op.
 let processorRunning = false;
@@ -84,6 +90,10 @@ export async function processWebhookQueue(
   }
   processorRunning = true;
   log.info({ maxEvents: opts.maxEvents ?? 100 }, "processWebhookQueue: starting");
+
+  // Reset any rows abandoned by a dead worker (Vercel timeout, crash, etc.)
+  // back to 'received' so this run can claim them. Cheap — indexed lookup.
+  await resetStuckProcessingRows();
 
   try {
     const max = opts.maxEvents ?? 100;
@@ -159,9 +169,11 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
   if (!candidate) return null;
 
   // Atomic flip: only succeed if the row's status hasn't changed under us.
+  // processing_started_at is the canonical "claim time" — used by
+  // resetStuckProcessingRows() to detect workers that died mid-flight.
   const { data: claimed, error: updErr } = await supabaseAdmin
     .from("webhook_events")
-    .update({ status: "processing" })
+    .update({ status: "processing", processing_started_at: new Date().toISOString() })
     .eq("id", candidate.id)
     .eq("status", candidate.status)
     .select(
@@ -174,6 +186,36 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
   }
   if (!claimed) return null; // someone else won the race
   return claimed as WebhookEventRow;
+}
+
+// Reset rows that were claimed (status='processing') but whose worker died
+// before marking them processed/failed. Vercel function timeout is 300s; any
+// processing row older than STUCK_PROCESSING_MS is definitively abandoned.
+// Two passes: (1) rows with processing_started_at set (post-migration claims),
+// (2) legacy rows where processing_started_at is null, fall back to received_at.
+async function resetStuckProcessingRows(): Promise<void> {
+  const cutoff = new Date(Date.now() - STUCK_PROCESSING_MS).toISOString();
+
+  const { error: e1, count: c1 } = await supabaseAdmin
+    .from("webhook_events")
+    .update({ status: "received" }, { count: "exact" })
+    .eq("status", "processing")
+    .not("processing_started_at", "is", null)
+    .lt("processing_started_at", cutoff);
+  if (e1) log.warn({ err: e1.message }, "resetStuckProcessingRows pass-1 failed");
+
+  const { error: e2, count: c2 } = await supabaseAdmin
+    .from("webhook_events")
+    .update({ status: "received" }, { count: "exact" })
+    .eq("status", "processing")
+    .is("processing_started_at", null)
+    .lt("received_at", cutoff);
+  if (e2) log.warn({ err: e2.message }, "resetStuckProcessingRows pass-2 failed");
+
+  const total = (c1 ?? 0) + (c2 ?? 0);
+  if (total > 0) {
+    log.info({ resetCount: total, cutoff }, "reset stuck processing rows");
+  }
 }
 
 type Outcome = "ok" | "fail" | "dead";
@@ -309,14 +351,23 @@ async function routeAndRun(ev: WebhookEventRow): Promise<void> {
       return;
     }
     case "inventory_levels": {
-      // inventory_levels/update payload has inventory_item_id + location_id.
-      // Route to inventory_items.incremental once that module gets one (Phase
-      // 3C). For now, log + park as a no-op success so the queue doesn't fill
-      // with retries. The Phase 5 catchup will eventually pick them up.
-      log.info(
-        { id: ev.id, payload: ev.payload },
-        "inventory_levels webhook noted — incremental sync handler not yet implemented",
-      );
+      // inventory_levels/update payload carries inventory_item_id (numeric)
+      // + location_id (numeric) + available (the new count). We don't trust
+      // the payload's `available` alone — committed/incoming/on_hand/etc.
+      // aren't in it. Dispatch to inventory_items.incremental(itemGid) which
+      // re-fetches the item + ALL its levels and upserts via the existing
+      // child extractor (composite UNIQUE on item+location → idempotent).
+      const itemNumeric = ev.payload?.inventory_item_id;
+      if (itemNumeric == null) {
+        throw new Error("inventory_levels webhook: missing inventory_item_id");
+      }
+      const itemGid = `gid://shopify/InventoryItem/${itemNumeric}`;
+      const r = await runIncremental({
+        resourceName: "inventory_items",
+        id: itemGid,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
       return;
     }
     case "fulfillment_orders": {
