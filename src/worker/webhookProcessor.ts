@@ -69,6 +69,8 @@ export interface ProcessorResult {
   processedFailed: number;
   deadLettered: number;
   totalDrained: number;
+  // queued events for the same resource made redundant by a successful fetch
+  superseded: number;
   durationMs: number;
 }
 
@@ -81,6 +83,7 @@ export async function processWebhookQueue(
     processedFailed: 0,
     deadLettered: 0,
     totalDrained: 0,
+    superseded: 0,
     durationMs: 0,
   };
 
@@ -101,8 +104,14 @@ export async function processWebhookQueue(
       const next = await claimNextEvent();
       if (!next) break;
       result.totalDrained += 1;
+      // Anything received before this moment is reflected in the fresh fetch
+      // (small margin for clock skew between Vercel and Postgres).
+      const fetchStartIso = new Date(Date.now() - 5_000).toISOString();
       const outcome = await processOne(next);
-      if (outcome === "ok") result.processedOk += 1;
+      if (outcome === "ok") {
+        result.processedOk += 1;
+        result.superseded += await supersedeCoveredEvents(next, fetchStartIso);
+      }
       else if (outcome === "dead") result.deadLettered += 1;
       else result.processedFailed += 1;
     }
@@ -124,17 +133,18 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
   const SELECT_COLS =
     "id, shopify_webhook_id, topic, resource_id, resource_name, payload, retry_count, hmac_valid, status";
 
-  // 1. Newest still-untried event (LIFO). Rationale: with sustained inventory
-  // churn, FIFO would starve fresh events behind days-old backlog. Each event
-  // re-fetches the resource's CURRENT state from Shopify, so processing the
-  // newest event for a resource is functionally equivalent to processing all
-  // older events for the same resource — the mirror lands at the same place.
-  // Old events that never get claimed are harmless; they'll be GC'd later.
+  // 1. Oldest still-untried event (FIFO + dedupe, 2026-09-16). The earlier LIFO
+  // order kept busy resources fresh but starved QUIET ones: a product edited
+  // once while traffic continued was never claimed (8 of 15 sampled products
+  // were a full day stale in the mirror). FIFO bounds every resource's lag, and
+  // supersedeCoveredEvents() removes the queued duplicates a successful fetch
+  // already covers (~40% of a daytime backlog), so the queue drains faster
+  // than LIFO did.
   const { data: receivedRows, error: rxErr } = await supabaseAdmin
     .from("webhook_events")
     .select(SELECT_COLS)
     .eq("status", "received")
-    .order("received_at", { ascending: false })
+    .order("received_at", { ascending: true })
     .limit(1);
   if (rxErr) {
     log.error({ err: rxErr.message }, "claimNextEvent received-select failed");
@@ -216,6 +226,52 @@ async function resetStuckProcessingRows(): Promise<void> {
   if (total > 0) {
     log.info({ resetCount: total, cutoff }, "reset stuck processing rows");
   }
+}
+
+// After a successful fetch of a resource's CURRENT state, every other queued
+// ('received') event for the same resource that arrived before the fetch began
+// is already reflected in the mirror. Mark those 'skipped' (last_error says by
+// which event) instead of re-fetching the same resource again.
+// Not applied to delete topics (either side) or to child topics (refunds /
+// fulfillments resolve their parent from the payload): those stay in the queue.
+async function supersedeCoveredEvents(ev: WebhookEventRow, fetchStartIso: string): Promise<number> {
+  const slash = ev.topic.indexOf("/");
+  const root = slash > 0 ? ev.topic.substring(0, slash) : ev.topic;
+  const action = slash > 0 ? ev.topic.substring(slash + 1) : "";
+  if (action === "delete") return 0;
+
+  let q = supabaseAdmin
+    .from("webhook_events")
+    .update(
+      {
+        status: "skipped",
+        processed_at: new Date().toISOString(),
+        last_error: `superseded by ${ev.id}`,
+      },
+      { count: "exact" },
+    )
+    .eq("status", "received")
+    .lt("received_at", fetchStartIso)
+    .neq("id", ev.id);
+
+  if (root === "inventory_levels") {
+    // one fetch refreshes the item's levels at ALL locations
+    const item = ev.payload?.inventory_item_id;
+    if (item == null) return 0;
+    q = q.eq("topic", "inventory_levels/update").like("resource_id", `%inventory_item_id=${item}`);
+  } else if (["orders", "customers", "products", "collections", "fulfillment_orders"].includes(root)) {
+    if (!ev.resource_id) return 0;
+    q = q.like("topic", `${root}/%`).neq("topic", `${root}/delete`).eq("resource_id", ev.resource_id);
+  } else {
+    return 0;
+  }
+
+  const { error, count } = await q;
+  if (error) {
+    log.warn({ err: error.message, id: ev.id }, "supersedeCoveredEvents failed");
+    return 0;
+  }
+  return count ?? 0;
 }
 
 type Outcome = "ok" | "fail" | "dead";
