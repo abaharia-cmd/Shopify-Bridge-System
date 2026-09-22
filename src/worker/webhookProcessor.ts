@@ -7,14 +7,15 @@
 //                          → failed (retry≤3)  (transient: stays in queue)
 //                          → dead_letter       (after 3 failures, also pushed to DLQ)
 //
-// Concurrency: a single in-process loop. The webhook receiver fires this off
-// after each enqueue (best-effort, non-blocking); the cron job calls it as a
-// safety net (in case the receiver was busy / cold-started). We do NOT use
-// SELECT ... FOR UPDATE SKIP LOCKED — concurrency between Next.js worker
-// instances is bounded to 1 per instance and our enqueue rate is low. The
-// race risk (two processors picking the same row) is mitigated by the
-// `status='received'` → `status='processing'` UPDATE returning the row count
-// — only one updater wins.
+// Concurrency: WEBHOOK_PROCESSOR_CONCURRENCY (default 4) in-process workers,
+// each claiming one event at a time (2026-09-22). The single loop did ~1
+// event/s; twice a day something rewrites ~4,400 products (12–14 and 22–00
+// Cairo) and the backlog took 1–2.5 h to drain, paging "DOWN" 21 times in 3
+// days. The webhook receiver fires this off after each enqueue (best-effort,
+// non-blocking); the cron job calls it as a safety net. We do NOT use
+// SELECT ... FOR UPDATE SKIP LOCKED — the `status='received'` →
+// `status='processing'` UPDATE (conditional on the old status) is the claim;
+// only one updater wins, losers simply try the next row.
 //
 // Refunds + fulfillments topics: there is no standalone refunds.ts /
 // fulfillments.ts module (they are child extractors under orders). This
@@ -33,6 +34,7 @@ import { pushDeadLetter, logError } from "./errors";
 const log = logger.child({ module: "worker.webhookProcessor" });
 
 const MAX_RETRIES = 3;
+const CONCURRENCY = Math.max(1, Math.min(16, Number(process.env.WEBHOOK_PROCESSOR_CONCURRENCY ?? 4) || 4));
 
 // Stuck-row cleanup window. Vercel functions max out at 300s; if a row has
 // been claimed (status='processing') for longer than this, the worker that
@@ -100,21 +102,26 @@ export async function processWebhookQueue(
 
   try {
     const max = opts.maxEvents ?? 100;
-    while (result.totalDrained < max) {
-      const next = await claimNextEvent();
-      if (!next) break;
-      result.totalDrained += 1;
-      // Anything received before this moment is reflected in the fresh fetch
-      // (small margin for clock skew between Vercel and Postgres).
-      const fetchStartIso = new Date(Date.now() - 5_000).toISOString();
-      const outcome = await processOne(next);
-      if (outcome === "ok") {
-        result.processedOk += 1;
-        result.superseded += await supersedeCoveredEvents(next, fetchStartIso);
+    let claimedTotal = 0;
+    const worker = async (): Promise<void> => {
+      while (claimedTotal < max) {
+        claimedTotal += 1; // reserve a slot before the async claim so N workers never overshoot max
+        const next = await claimNextEvent();
+        if (!next) { claimedTotal -= 1; break; }
+        result.totalDrained += 1;
+        // Anything received before this moment is reflected in the fresh fetch
+        // (small margin for clock skew between Vercel and Postgres).
+        const fetchStartIso = new Date(Date.now() - 5_000).toISOString();
+        const outcome = await processOne(next);
+        if (outcome === "ok") {
+          result.processedOk += 1;
+          result.superseded += await supersedeCoveredEvents(next, fetchStartIso);
+        }
+        else if (outcome === "dead") result.deadLettered += 1;
+        else result.processedFailed += 1;
       }
-      else if (outcome === "dead") result.deadLettered += 1;
-      else result.processedFailed += 1;
-    }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
   } finally {
     processorRunning = false;
     result.durationMs = Date.now() - t0;
@@ -130,6 +137,17 @@ export async function processWebhookQueue(
 // ISO-timestamp special chars in the failed-row sub-filter, returning empty.
 // Two queries is plenty fast for our enqueue rate.
 async function claimNextEvent(): Promise<WebhookEventRow | null> {
+  // With several workers the oldest 'received' row is often taken between our
+  // SELECT and our conditional UPDATE; a lost race means "try the next row",
+  // not "queue empty".
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const r = await claimNextEventOnce();
+    if (r !== "lost") return r;
+  }
+  return null;
+}
+
+async function claimNextEventOnce(): Promise<WebhookEventRow | null | "lost"> {
   const SELECT_COLS =
     "id, shopify_webhook_id, topic, resource_id, resource_name, payload, retry_count, hmac_valid, status";
 
@@ -194,7 +212,7 @@ async function claimNextEvent(): Promise<WebhookEventRow | null> {
     log.warn({ err: updErr.message, id: candidate.id }, "claimNextEvent update failed");
     return null;
   }
-  if (!claimed) return null; // someone else won the race
+  if (!claimed) return "lost"; // someone else won the race
   return claimed as WebhookEventRow;
 }
 
