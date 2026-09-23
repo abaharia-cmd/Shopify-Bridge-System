@@ -1,0 +1,550 @@
+// Webhook event processor. Reads pending rows from shopify_sync.webhook_events,
+// dispatches each by topic to the right incremental sync action, and updates
+// the row's status (processed / failed / dead_letter) per outcome.
+//
+// Lifecycle of a webhook_events row:
+//   received  → processing → processed         (happy path)
+//                          → failed (retry≤3)  (transient: stays in queue)
+//                          → dead_letter       (after 3 failures, also pushed to DLQ)
+//
+// Concurrency: WEBHOOK_PROCESSOR_CONCURRENCY (default 4) in-process workers,
+// each claiming one event at a time (2026-09-22). The single loop did ~1
+// event/s; twice a day something rewrites ~4,400 products (12–14 and 22–00
+// Cairo) and the backlog took 1–2.5 h to drain, paging "DOWN" 21 times in 3
+// days. The webhook receiver fires this off after each enqueue (best-effort,
+// non-blocking); the cron job calls it as a safety net. We do NOT use
+// SELECT ... FOR UPDATE SKIP LOCKED — the `status='received'` →
+// `status='processing'` UPDATE (conditional on the old status) is the claim;
+// only one updater wins, losers simply try the next row.
+//
+// Refunds + fulfillments topics: there is no standalone refunds.ts /
+// fulfillments.ts module (they are child extractors under orders). This
+// processor extracts the parent order GID from the webhook payload and
+// dispatches to orders.incremental — which re-fetches the order PLUS all its
+// children (line items, transactions, fulfillments, refunds, journey, visits).
+// Net effect: the new refund/fulfillment row lands as a child upsert on the
+// next orders.incremental call.
+
+import { supabaseAdmin } from "../lib/supabase/admin";
+import { logger } from "../lib/logger";
+import { runIncremental } from "./runners/incrementalRunner";
+import { resourceRegistry } from "../resources";
+import { pushDeadLetter, logError } from "./errors";
+
+const log = logger.child({ module: "worker.webhookProcessor" });
+
+const MAX_RETRIES = 3;
+const CONCURRENCY = Math.max(1, Math.min(16, Number(process.env.WEBHOOK_PROCESSOR_CONCURRENCY ?? 4) || 4));
+
+// Stuck-row cleanup window. Vercel functions max out at 300s; if a row has
+// been claimed (status='processing') for longer than this, the worker that
+// claimed it is definitively dead. Reset it to 'received' so the next
+// processor picks it up. 10 min is comfortably > 5 min Vercel ceiling.
+const STUCK_PROCESSING_MS = 10 * 60_000;
+
+// Ensure only one in-process processor runs at a time. Callers can fire and
+// forget; subsequent calls during an in-flight run no-op.
+let processorRunning = false;
+
+interface WebhookEventRow {
+  id: string;
+  shopify_webhook_id: string | null;
+  topic: string;
+  resource_id: string | null;
+  resource_name: string | null;
+  // reason: webhook payloads are arbitrary JSON, narrowed per-topic at use site.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload: any;
+  retry_count: number;
+  hmac_valid: boolean;
+}
+
+export interface ProcessorOpts {
+  // Max events to drain per call. Caller can keep calling until the queue
+  // empties; we cap each invocation so a stuck / slow Shopify endpoint can't
+  // monopolize a single Lambda invocation.
+  maxEvents?: number;
+}
+
+export interface ProcessorResult {
+  processedOk: number;
+  processedFailed: number;
+  deadLettered: number;
+  totalDrained: number;
+  // queued events for the same resource made redundant by a successful fetch
+  superseded: number;
+  durationMs: number;
+}
+
+export async function processWebhookQueue(
+  opts: ProcessorOpts = {},
+): Promise<ProcessorResult> {
+  const t0 = Date.now();
+  const result: ProcessorResult = {
+    processedOk: 0,
+    processedFailed: 0,
+    deadLettered: 0,
+    totalDrained: 0,
+    superseded: 0,
+    durationMs: 0,
+  };
+
+  if (processorRunning) {
+    log.info("processWebhookQueue: another instance already running — skipping");
+    return result;
+  }
+  processorRunning = true;
+  log.info({ maxEvents: opts.maxEvents ?? 100 }, "processWebhookQueue: starting");
+
+  // Reset any rows abandoned by a dead worker (Vercel timeout, crash, etc.)
+  // back to 'received' so this run can claim them. Cheap — indexed lookup.
+  await resetStuckProcessingRows();
+
+  try {
+    const max = opts.maxEvents ?? 100;
+    let claimedTotal = 0;
+    const worker = async (): Promise<void> => {
+      while (claimedTotal < max) {
+        claimedTotal += 1; // reserve a slot before the async claim so N workers never overshoot max
+        const next = await claimNextEvent();
+        if (!next) { claimedTotal -= 1; break; }
+        result.totalDrained += 1;
+        // Anything received before this moment is reflected in the fresh fetch
+        // (small margin for clock skew between Vercel and Postgres).
+        const fetchStartIso = new Date(Date.now() - 5_000).toISOString();
+        const outcome = await processOne(next);
+        if (outcome === "ok") {
+          result.processedOk += 1;
+          result.superseded += await supersedeCoveredEvents(next, fetchStartIso);
+        }
+        else if (outcome === "dead") result.deadLettered += 1;
+        else result.processedFailed += 1;
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
+  } finally {
+    processorRunning = false;
+    result.durationMs = Date.now() - t0;
+  }
+
+  log.info(result, "processWebhookQueue done");
+  return result;
+}
+
+// Atomically claim the next event ready to be worked on. Two simple queries
+// (received-first, then retry-eligible failed) — earlier attempt used a single
+// .or() with nested and() but PostgREST's filter parser kept tripping on the
+// ISO-timestamp special chars in the failed-row sub-filter, returning empty.
+// Two queries is plenty fast for our enqueue rate.
+async function claimNextEvent(): Promise<WebhookEventRow | null> {
+  // With several workers the oldest 'received' row is often taken between our
+  // SELECT and our conditional UPDATE; a lost race means "try the next row",
+  // not "queue empty".
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const r = await claimNextEventOnce();
+    if (r !== "lost") return r;
+  }
+  return null;
+}
+
+async function claimNextEventOnce(): Promise<WebhookEventRow | null | "lost"> {
+  const SELECT_COLS =
+    "id, shopify_webhook_id, topic, resource_id, resource_name, payload, retry_count, hmac_valid, status";
+
+  // 1. Oldest still-untried event (FIFO + dedupe, 2026-09-16). The earlier LIFO
+  // order kept busy resources fresh but starved QUIET ones: a product edited
+  // once while traffic continued was never claimed (8 of 15 sampled products
+  // were a full day stale in the mirror). FIFO bounds every resource's lag, and
+  // supersedeCoveredEvents() removes the queued duplicates a successful fetch
+  // already covers (~40% of a daytime backlog), so the queue drains faster
+  // than LIFO did.
+  const { data: receivedRows, error: rxErr } = await supabaseAdmin
+    .from("webhook_events")
+    .select(SELECT_COLS)
+    .eq("status", "received")
+    .order("received_at", { ascending: true })
+    .limit(1);
+  if (rxErr) {
+    log.error({ err: rxErr.message }, "claimNextEvent received-select failed");
+    return null;
+  }
+
+  let candidate: (WebhookEventRow & { status: string }) | null =
+    receivedRows && receivedRows.length
+      ? (receivedRows[0] as WebhookEventRow & { status: string })
+      : null;
+
+  // 2. If nothing fresh, look for failed events past the back-off window.
+  if (!candidate) {
+    const cutoff = new Date(Date.now() - 60_000).toISOString();
+    const { data: failedRows, error: fxErr } = await supabaseAdmin
+      .from("webhook_events")
+      .select(SELECT_COLS + ", last_failed_at")
+      .eq("status", "failed")
+      .lt("retry_count", MAX_RETRIES)
+      .lt("last_failed_at", cutoff)
+      .order("last_failed_at", { ascending: false })
+      .limit(1);
+    if (fxErr) {
+      log.error({ err: fxErr.message }, "claimNextEvent failed-select failed");
+      return null;
+    }
+    if (failedRows && failedRows.length) {
+      candidate = failedRows[0] as unknown as WebhookEventRow & { status: string };
+    }
+  }
+
+  if (!candidate) return null;
+
+  // Atomic flip: only succeed if the row's status hasn't changed under us.
+  // processing_started_at is the canonical "claim time" — used by
+  // resetStuckProcessingRows() to detect workers that died mid-flight.
+  const { data: claimed, error: updErr } = await supabaseAdmin
+    .from("webhook_events")
+    .update({ status: "processing", processing_started_at: new Date().toISOString() })
+    .eq("id", candidate.id)
+    .eq("status", candidate.status)
+    .select(
+      "id, shopify_webhook_id, topic, resource_id, resource_name, payload, retry_count, hmac_valid",
+    )
+    .maybeSingle();
+  if (updErr) {
+    log.warn({ err: updErr.message, id: candidate.id }, "claimNextEvent update failed");
+    return null;
+  }
+  if (!claimed) return "lost"; // someone else won the race
+  return claimed as WebhookEventRow;
+}
+
+// Reset rows that were claimed (status='processing') but whose worker died
+// before marking them processed/failed. Vercel function timeout is 300s; any
+// processing row older than STUCK_PROCESSING_MS is definitively abandoned.
+// Two passes: (1) rows with processing_started_at set (post-migration claims),
+// (2) legacy rows where processing_started_at is null, fall back to received_at.
+async function resetStuckProcessingRows(): Promise<void> {
+  const cutoff = new Date(Date.now() - STUCK_PROCESSING_MS).toISOString();
+
+  const { error: e1, count: c1 } = await supabaseAdmin
+    .from("webhook_events")
+    .update({ status: "received" }, { count: "exact" })
+    .eq("status", "processing")
+    .not("processing_started_at", "is", null)
+    .lt("processing_started_at", cutoff);
+  if (e1) log.warn({ err: e1.message }, "resetStuckProcessingRows pass-1 failed");
+
+  const { error: e2, count: c2 } = await supabaseAdmin
+    .from("webhook_events")
+    .update({ status: "received" }, { count: "exact" })
+    .eq("status", "processing")
+    .is("processing_started_at", null)
+    .lt("received_at", cutoff);
+  if (e2) log.warn({ err: e2.message }, "resetStuckProcessingRows pass-2 failed");
+
+  const total = (c1 ?? 0) + (c2 ?? 0);
+  if (total > 0) {
+    log.info({ resetCount: total, cutoff }, "reset stuck processing rows");
+  }
+}
+
+// After a successful fetch of a resource's CURRENT state, every other queued
+// ('received') event for the same resource that arrived before the fetch began
+// is already reflected in the mirror. Mark those 'skipped' (last_error says by
+// which event) instead of re-fetching the same resource again.
+// Not applied to delete topics (either side) or to child topics (refunds /
+// fulfillments resolve their parent from the payload): those stay in the queue.
+async function supersedeCoveredEvents(ev: WebhookEventRow, fetchStartIso: string): Promise<number> {
+  const slash = ev.topic.indexOf("/");
+  const root = slash > 0 ? ev.topic.substring(0, slash) : ev.topic;
+  const action = slash > 0 ? ev.topic.substring(slash + 1) : "";
+  if (action === "delete") return 0;
+
+  let q = supabaseAdmin
+    .from("webhook_events")
+    .update(
+      {
+        status: "skipped",
+        processed_at: new Date().toISOString(),
+        last_error: `superseded by ${ev.id}`,
+      },
+      { count: "exact" },
+    )
+    .eq("status", "received")
+    .lt("received_at", fetchStartIso)
+    .neq("id", ev.id);
+
+  if (root === "inventory_levels") {
+    // one fetch refreshes the item's levels at ALL locations
+    const item = ev.payload?.inventory_item_id;
+    if (item == null) return 0;
+    q = q.eq("topic", "inventory_levels/update").like("resource_id", `%inventory_item_id=${item}`);
+  } else if (["orders", "customers", "products", "collections", "fulfillment_orders"].includes(root)) {
+    if (!ev.resource_id) return 0;
+    q = q.like("topic", `${root}/%`).neq("topic", `${root}/delete`).eq("resource_id", ev.resource_id);
+  } else {
+    return 0;
+  }
+
+  const { error, count } = await q;
+  if (error) {
+    log.warn({ err: error.message, id: ev.id }, "supersedeCoveredEvents failed");
+    return 0;
+  }
+  return count ?? 0;
+}
+
+type Outcome = "ok" | "fail" | "dead";
+
+async function processOne(ev: WebhookEventRow): Promise<Outcome> {
+  const t0 = Date.now();
+  log.debug({ topic: ev.topic, id: ev.id, resourceId: ev.resource_id }, "processing webhook");
+
+  try {
+    await routeAndRun(ev);
+    await markProcessed(ev.id, Date.now() - t0);
+    return "ok";
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const newRetryCount = ev.retry_count + 1;
+
+    if (newRetryCount >= MAX_RETRIES) {
+      await markDeadLetter(ev, errMsg);
+      await pushDeadLetter({
+        resourceName: ev.resource_name ?? ev.topic.split("/")[0] ?? "unknown",
+        shopifyId: ev.resource_id,
+        source: `webhook:${ev.topic}`,
+        rawPayload: ev.payload,
+        errorMessage: errMsg,
+      });
+      log.error(
+        { topic: ev.topic, id: ev.id, resourceId: ev.resource_id, retryCount: newRetryCount, err: errMsg },
+        "webhook moved to dead_letter",
+      );
+      return "dead";
+    }
+
+    await markFailed(ev.id, newRetryCount, errMsg, Date.now() - t0);
+    log.warn(
+      { topic: ev.topic, id: ev.id, retryCount: newRetryCount, err: errMsg },
+      "webhook processing failed — will retry",
+    );
+    return "fail";
+  }
+}
+
+// Route a webhook to the right action based on its topic.
+async function routeAndRun(ev: WebhookEventRow): Promise<void> {
+  const slash = ev.topic.indexOf("/");
+  const root = slash > 0 ? ev.topic.substring(0, slash) : ev.topic;
+  const action = slash > 0 ? ev.topic.substring(slash + 1) : "";
+
+  // Resolve the resource GID. For top-level resources we use ev.resource_id
+  // (already extracted by the receiver). For child topics (refunds,
+  // fulfillments) we extract the parent order GID from the payload.
+  switch (root) {
+    case "orders": {
+      // create | updated | cancelled | fulfilled | partially_fulfilled
+      if (!ev.resource_id) throw new Error("orders webhook: no resource_id");
+      if (action === "delete") {
+        await softDeleteIfPossible("orders", ev.resource_id);
+        return;
+      }
+      const r = await runIncremental({
+        resourceName: "orders",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "customers": {
+      if (!ev.resource_id) throw new Error("customers webhook: no resource_id");
+      if (action === "delete") {
+        await softDeleteIfPossible("customers", ev.resource_id);
+        return;
+      }
+      const r = await runIncremental({
+        resourceName: "customers",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "products": {
+      if (!ev.resource_id) throw new Error("products webhook: no resource_id");
+      if (action === "delete") {
+        await softDeleteIfPossible("products", ev.resource_id);
+        return;
+      }
+      const r = await runIncremental({
+        resourceName: "products",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "collections": {
+      if (!ev.resource_id) throw new Error("collections webhook: no resource_id");
+      if (action === "delete") {
+        await softDeleteIfPossible("collections", ev.resource_id);
+        return;
+      }
+      const r = await runIncremental({
+        resourceName: "collections",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "refunds": {
+      // refunds/create payload includes an order_id (numeric, REST-style) or
+      // admin_graphql_api_id-style nested order field. Either way, route to
+      // orders.incremental(orderGid) to refresh the parent + all children.
+      const orderGid = extractOrderGidFromChildPayload(ev.payload);
+      if (!orderGid) throw new Error("refunds webhook: cannot resolve parent order GID");
+      const r = await runIncremental({
+        resourceName: "orders",
+        id: orderGid,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}:viaRefund(${ev.resource_id ?? "?"})`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "fulfillments": {
+      // fulfillments/create + fulfillments/update — same pattern as refunds.
+      const orderGid = extractOrderGidFromChildPayload(ev.payload);
+      if (!orderGid) throw new Error("fulfillments webhook: cannot resolve parent order GID");
+      const r = await runIncremental({
+        resourceName: "orders",
+        id: orderGid,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}:viaFulfillment(${ev.resource_id ?? "?"})`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "inventory_levels": {
+      // inventory_levels/update payload carries inventory_item_id (numeric)
+      // + location_id (numeric) + available (the new count). We don't trust
+      // the payload's `available` alone — committed/incoming/on_hand/etc.
+      // aren't in it. Dispatch to inventory_items.incremental(itemGid) which
+      // re-fetches the item + ALL its levels and upserts via the existing
+      // child extractor (composite UNIQUE on item+location → idempotent).
+      const itemNumeric = ev.payload?.inventory_item_id;
+      if (itemNumeric == null) {
+        throw new Error("inventory_levels webhook: missing inventory_item_id");
+      }
+      const itemGid = `gid://shopify/InventoryItem/${itemNumeric}`;
+      const r = await runIncremental({
+        resourceName: "inventory_items",
+        id: itemGid,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    case "fulfillment_orders": {
+      // All fulfillment_orders/* topics: order_routing_complete, moved, split,
+      // merged, cancelled, placed_on_hold, hold_released, etc. The payload's
+      // top-level id IS the FulfillmentOrder id; the receiver already extracted
+      // it as ev.resource_id. Re-fetch the FO and upsert via incremental.
+      if (!ev.resource_id) throw new Error("fulfillment_orders webhook: no resource_id");
+      const r = await runIncremental({
+        resourceName: "fulfillment_orders",
+        id: ev.resource_id,
+        triggeredBy: `webhook:${ev.topic}:${ev.shopify_webhook_id ?? ev.id}`,
+      });
+      if (r.errorMessage) throw new Error(r.errorMessage);
+      return;
+    }
+    default: {
+      throw new Error(`unrouted webhook topic: ${ev.topic}`);
+    }
+  }
+}
+
+// Pull a parent order GID out of a refunds/fulfillments webhook payload.
+// Tries (in order): payload.admin_graphql_api_order_id, payload.order_id (REST
+// numeric → reconstruct GID), payload.order.admin_graphql_api_id.
+// reason: webhook payloads are arbitrary JSON across topics.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractOrderGidFromChildPayload(payload: any): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  if (typeof payload.admin_graphql_api_order_id === "string") {
+    return payload.admin_graphql_api_order_id;
+  }
+  if (payload.order?.admin_graphql_api_id) {
+    return String(payload.order.admin_graphql_api_id);
+  }
+  if (payload.order_id != null) {
+    return `gid://shopify/Order/${payload.order_id}`;
+  }
+  return null;
+}
+
+async function softDeleteIfPossible(
+  resourceName: string,
+  id: string,
+): Promise<void> {
+  const mod = resourceRegistry[resourceName];
+  if (!mod?.softDelete) {
+    log.warn({ resourceName, id }, "delete topic but no softDelete handler — ignoring");
+    return;
+  }
+  await mod.softDelete(id, "webhook");
+}
+
+async function markProcessed(id: string, durationMs: number): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("webhook_events")
+    .update({
+      status: "processed",
+      processed_at: new Date().toISOString(),
+      processing_duration_ms: durationMs,
+    })
+    .eq("id", id);
+  if (error) log.error({ err: error.message, id }, "markProcessed failed");
+}
+
+async function markFailed(
+  id: string,
+  retryCount: number,
+  errorMessage: string,
+  durationMs: number,
+): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("webhook_events")
+    .update({
+      status: "failed",
+      retry_count: retryCount,
+      last_error: errorMessage,
+      last_failed_at: new Date().toISOString(),
+      processing_duration_ms: durationMs,
+    })
+    .eq("id", id);
+  if (error) log.error({ err: error.message, id }, "markFailed failed");
+}
+
+async function markDeadLetter(
+  ev: WebhookEventRow,
+  errorMessage: string,
+): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("webhook_events")
+    .update({
+      status: "dead_letter",
+      retry_count: ev.retry_count + 1,
+      last_error: errorMessage,
+      last_failed_at: new Date().toISOString(),
+    })
+    .eq("id", ev.id);
+  if (error) {
+    log.error({ err: error.message, id: ev.id }, "markDeadLetter failed");
+    await logError({
+      source: "worker.webhookProcessor.markDeadLetter",
+      errorMessage: error.message,
+      context: { eventId: ev.id, topic: ev.topic },
+    });
+  }
+}
